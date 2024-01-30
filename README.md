@@ -6,13 +6,19 @@ by Emmanuel John.
 
 ## Running
 
+### Running with in-memory store
+
+```bash
+go run main.go
+```
+
+### Running with postgres
+
 ```bash
 export PGUSER=<pg user> # defaults to postgres
 export PGPASSWORD=<pg password>
 export PGSSLMODE=<ssl mode> # defaults to require
-export PGHOST=<pg host> # defaults to localhost:6432
+export PGHOST=<pg host>
 export DBNAME=<db name> # defaults to mydb
 ```
 
-## Updating the app image
-This applicatio is used by various demos. Build and push an updated image any time you make a change. The image is published at [https://hub.docker.com/repository/docker/syntasso/sample-todo-app](https://hub.docker.com/repository/docker/syntasso/sample-todo-app).

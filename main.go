@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -18,24 +20,148 @@ type todo struct {
 	Item string
 }
 
+type Todoer interface {
+	NewTodo(*fiber.Ctx) error
+	GetTodos(*fiber.Ctx, string) error
+	DeleteTodo(*fiber.Ctx) error
+	Healthcheck(c *fiber.Ctx) error
+	Init() error
+}
+
+type PGDB struct {
+	DB *sql.DB
+}
+
+func (p *PGDB) GetTodos(ctx *fiber.Ctx, version string) error {
+	var res string
+	var todos []string
+	rows, err := p.DB.Query("SELECT * FROM todos")
+	if err != nil {
+		log.Fatalln(err)
+		ctx.JSON("An error occurred")
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		rows.Scan(&res)
+		todos = append(todos, res)
+	}
+
+	return ctx.Render("index", fiber.Map{
+		"Todos":      todos,
+		"Enterprise": os.Getenv("ENTERPRISE"),
+		"Version":    version,
+	})
+}
+
+func (p *PGDB) NewTodo(ctx *fiber.Ctx) error {
+	newTodo := todo{}
+	if err := ctx.BodyParser(&newTodo); err != nil {
+		log.Printf("An error occurred: %v", err)
+		return ctx.SendString(err.Error())
+	}
+	fmt.Printf("Creating a new To Do: %q\n", newTodo)
+	if newTodo.Item != "" {
+		_, err := p.DB.Exec("INSERT into todos VALUES ($1)", newTodo.Item)
+		if err != nil {
+			log.Fatalf("An error occurred while executing query: %v", err)
+		}
+	}
+
+	return ctx.Redirect("/")
+}
+
+func (p *PGDB) DeleteTodo(c *fiber.Ctx) error {
+	todoToDelete := c.Query("item")
+	p.DB.Exec("DELETE from todos WHERE item=$1", todoToDelete)
+	fmt.Printf("Deleting To Do: %q\n", todoToDelete)
+	return c.SendString("deleted")
+}
+
+func (p *PGDB) Healthcheck(c *fiber.Ctx) error {
+	err := p.DB.Ping()
+	if err != nil {
+		c.SendString(err.Error())
+	}
+	return err
+}
+
+func (p *PGDB) Init() error {
+	_, err := p.DB.Exec("CREATE TABLE IF NOT EXISTS todos (item text)")
+	return err
+}
+
+type LocalDB struct {
+	Todos []string
+}
+
+func (l *LocalDB) GetTodos(ctx *fiber.Ctx, version string) error {
+	return ctx.Render("index", fiber.Map{
+		"Todos":      l.Todos,
+		"Enterprise": os.Getenv("ENTERPRISE"),
+		"Version":    version,
+	})
+}
+
+func (l *LocalDB) NewTodo(ctx *fiber.Ctx) error {
+	newTodo := todo{}
+	if err := ctx.BodyParser(&newTodo); err != nil {
+		log.Printf("An error occurred: %v", err)
+		return ctx.SendString(err.Error())
+	}
+	fmt.Printf("Creating a new To Do: %q\n", newTodo)
+	if newTodo.Item != "" {
+		l.Todos = append(l.Todos, newTodo.Item)
+	}
+
+	return ctx.Redirect("/")
+}
+
+func (l *LocalDB) DeleteTodo(c *fiber.Ctx) error {
+	todoToDelete := c.Query("item")
+	for i, todo := range l.Todos {
+		if strings.EqualFold(todo, todoToDelete) {
+			l.Todos = slices.Delete(l.Todos, i, i+1)
+		}
+	}
+	fmt.Printf("Deleting To Do: %q\n", todoToDelete)
+	return c.SendString("deleted")
+}
+
+func (p *LocalDB) Healthcheck(c *fiber.Ctx) error {
+	return nil
+}
+
+func (p *LocalDB) Init() error {
+	return nil
+}
+
 func main() {
 	pgUser := or(or(os.Getenv("DB_USER"), os.Getenv("PGUSER")), "postgres")
 	pgPassword := or(os.Getenv("DB_PASSWORD"), os.Getenv("PGPASSWORD"))
-	pgHost := or(or(os.Getenv("DB_HOST"), os.Getenv("PGHOST")), "localhost:5432")
+	pgHost := or(os.Getenv("DB_HOST"), os.Getenv("PGHOST"))
 	pgSSLMode := or(or(os.Getenv("DB_SSL_MODE"), os.Getenv("PGSSLMODE")), "require")
 	dbName := or(or(os.Getenv("DB_NAME"), os.Getenv("DBNAME")), "mydb")
-
-	connStr := fmt.Sprintf("postgresql://%s:%s@%s/%s?sslmode=%s", pgUser, pgPassword, pgHost, dbName, pgSSLMode)
 
 	version := os.Getenv("VERSION")
 	fmt.Println("Version: ", version)
 
-	// Connect to database
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		log.Fatal(err)
+	var querier Todoer
+	if pgHost != "" {
+		// Connect to database if PGHOST is set
+		connStr := fmt.Sprintf("postgresql://%s:%s@%s/%s?sslmode=%s", pgUser, pgPassword, pgHost, dbName, pgSSLMode)
+		db, err := sql.Open("postgres", connStr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer db.Close()
+
+		querier = &PGDB{
+			DB: db,
+		}
+	} else {
+		querier = &LocalDB{}
 	}
-	defer db.Close()
 
 	engine := html.New("./views", ".html")
 	app := fiber.New(fiber.Config{
@@ -45,23 +171,20 @@ func main() {
 	//checked by kubernetes to see if the pod is ready to receive traffic
 	app.Get("/healthz", func(c *fiber.Ctx) error {
 		fmt.Println("healthcheck")
-		err := db.Ping()
-		if err != nil {
-			c.SendString(err.Error())
-		}
+		err := querier.Healthcheck(c)
 		return err
 	})
 
 	app.Get("/", func(c *fiber.Ctx) error {
-		return getTodos(c, db, version)
+		return querier.GetTodos(c, version)
 	})
 
 	app.Post("/", func(c *fiber.Ctx) error {
-		return newTodo(c, db)
+		return querier.NewTodo(c)
 	})
 
 	app.Delete("/delete", func(c *fiber.Ctx) error {
-		return deleteTodo(c, db)
+		return querier.DeleteTodo(c)
 	})
 
 	port := or(os.Getenv("PORT"), "8080")
@@ -74,8 +197,8 @@ func main() {
 		x := 0
 		for {
 			log.Println("Attempting to connect to DB")
-
-			if err := initDB(db); err == nil {
+			var err error
+			if err = querier.Init(); err == nil {
 				break
 			}
 
@@ -90,57 +213,6 @@ func main() {
 		}
 	}()
 	log.Println(app.Listen(fmt.Sprintf(":%v", port)))
-}
-
-func getTodos(c *fiber.Ctx, db *sql.DB, version string) error {
-	var res string
-	var todos []string
-	rows, err := db.Query("SELECT * FROM todos")
-	if err != nil {
-		log.Fatalln(err)
-		c.JSON("An error occured")
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		rows.Scan(&res)
-		todos = append(todos, res)
-	}
-
-	return c.Render("index", fiber.Map{
-		"Todos":      todos,
-		"Enterprise": os.Getenv("ENTERPRISE"),
-		"Version":    version,
-	})
-}
-
-func newTodo(c *fiber.Ctx, db *sql.DB) error {
-	newTodo := todo{}
-	if err := c.BodyParser(&newTodo); err != nil {
-		log.Printf("An error occured: %v", err)
-		return c.SendString(err.Error())
-	}
-	fmt.Printf("Creating a new To Do: %q\n", newTodo)
-	if newTodo.Item != "" {
-		_, err := db.Exec("INSERT into todos VALUES ($1)", newTodo.Item)
-		if err != nil {
-			log.Fatalf("An error occured while executing query: %v", err)
-		}
-	}
-
-	return c.Redirect("/")
-}
-
-func deleteTodo(c *fiber.Ctx, db *sql.DB) error {
-	todoToDelete := c.Query("item")
-	db.Exec("DELETE from todos WHERE item=$1", todoToDelete)
-	fmt.Printf("Deleting To Do: %q\n", todoToDelete)
-	return c.SendString("deleted")
-}
-
-func initDB(db *sql.DB) error {
-	_, err := db.Exec("CREATE TABLE IF NOT EXISTS todos (item text)")
-	return err
 }
 
 func or(a string, b string) string {
