@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -168,8 +169,11 @@ func main() {
 		querier = &LocalDB{}
 	}
 
-	t := http.FS(templates)
-	engine := html.NewFileSystem(t, ".html")
+	views, err := fs.Sub(templates, "views")
+	if err != nil {
+		log.Fatal(err)
+	}
+	engine := html.NewFileSystem(http.FS(views), ".html")
 	app := fiber.New(fiber.Config{
 		Views: engine,
 	})
