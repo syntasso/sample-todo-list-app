@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"embed"
 	"fmt"
 	"log"
 	"os"
@@ -15,6 +16,9 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/template/html"
 )
+
+//go:embed views/*
+var templates embed.FS
 
 type todo struct {
 	Item string
